@@ -1,0 +1,102 @@
+name: Windows installer
+
+on:
+  workflow_dispatch:
+    inputs:
+      upstream_ref:
+        description: 'Upstream branch or tag to build (empty = default branch)'
+        default: ''
+  push:
+    tags: ['win-v*']
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4   # this repo: installer/Chimera.iss
+
+      - name: Download the CHIMERA source (MIT)
+        shell: bash
+        env:
+          REF: ${{ inputs.upstream_ref }}
+        run: |
+          git config --global core.autocrlf false
+          git config --global core.longpaths true
+          for i in 1 2 3; do
+            rm -rf upstream
+            if [ -n "$REF" ]; then
+              git clone --depth 1 --branch "$REF" https://github.com/jamesondh/chimera-vocal-synth.git upstream && break
+            else
+              git clone --depth 1 https://github.com/jamesondh/chimera-vocal-synth.git upstream && break
+            fi
+            echo "clone attempt $i failed"; sleep 10
+          done
+          test -d upstream/.git
+          test -f upstream/package.json
+          test -f upstream/crates/chimera-plugin/windows/build.sh
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: upstream
+      - uses: oven-sh/setup-bun@v2
+
+      - name: Build the web UI
+        shell: bash
+        working-directory: upstream
+        run: |
+          bun install --frozen-lockfile || bun install
+          bun run build
+
+      - name: Build the plugin (upstream script)
+        shell: bash
+        working-directory: upstream
+        run: bash crates/chimera-plugin/windows/build.sh
+
+      - name: Stage the built plugin files
+        id: stage
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force stage/VST3, stage/CLAP | Out-Null
+          Copy-Item upstream/LICENSE LICENSE -Force
+          $all = Get-ChildItem -Recurse -Force -Path upstream -ErrorAction SilentlyContinue |
+                 Where-Object { $_.FullName -notmatch 'node_modules' }
+          # Prefer the outer bundle folder (if any), then the shortest path
+          $pick = { param($n) $all | Where-Object { $_.Name -ieq $n } |
+                    Sort-Object @{e={-not $_.PSIsContainer}}, @{e={$_.FullName.Length}} |
+                    Select-Object -First 1 }
+          $vst3 = & $pick 'CHIMERA.vst3'
+          $clap = & $pick 'CHIMERA.clap'
+          if (-not $vst3) { throw 'CHIMERA.vst3 not found - check what windows/build.sh outputs' }
+          Copy-Item $vst3.FullName stage/VST3/ -Recurse -Force
+          if ($clap) {
+            Copy-Item $clap.FullName stage/CLAP/ -Recurse -Force
+            "with_clap=1" >> $env:GITHUB_OUTPUT
+          }
+          Get-ChildItem -Recurse stage | Select-Object FullName
+
+      - name: Build installer
+        shell: pwsh
+        run: |
+          $ver = if ($env:GITHUB_REF -like 'refs/tags/win-v*') { $env:GITHUB_REF -replace '^refs/tags/win-v','' } else { "0.0.0-dev.$($env:GITHUB_RUN_NUMBER)" }
+          $defs = @("/DAppVersion=$ver")
+          if ('${{ steps.stage.outputs.with_clap }}' -eq '1') { $defs += '/DWITH_CLAP=1' }
+          choco install innosetup -y --no-progress
+          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" @defs installer\Chimera.iss
+          if ($LASTEXITCODE -ne 0) { throw "ISCC failed" }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: CHIMERA-Windows-Installer
+          path: dist/CHIMERA-Setup.exe
+
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/win-v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/CHIMERA-Setup.exe
